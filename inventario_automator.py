@@ -144,9 +144,27 @@ def token_sort_ratio(a: str, b: str) -> float:
     return SequenceMatcher(None, a_sorted, b_sorted).ratio()
  
  
+def prefix_match_score(a: str, b: str) -> float:
+    """Returns a high score when one string is a prefix of the other.
+    Handles: 'bisagra' vs 'bisagras para puerta', 'zapapico' vs 'zapapico herrago 5 lbs',
+             'cabo 1/2' vs 'cabo', 'maxicril - 70 gl' vs 'maxicril'.
+    Score = 0.80 + 0.20 * coverage, so always above FUZZY_THRESHOLD.
+    Requires the shorter string to be at least 4 characters.
+    """
+    if not a or not b:
+        return 0.0
+    short, long = (a, b) if len(a) <= len(b) else (b, a)
+    if len(short) < 4:
+        return 0.0
+    if long.startswith(short):
+        coverage = len(short) / len(long)
+        return 0.80 + 0.20 * coverage
+    return 0.0
+ 
+ 
 def best_similarity(a: str, b: str) -> float:
-    """Returns the best score between direct similarity and token-sort similarity."""
-    return max(similarity(a, b), token_sort_ratio(a, b))
+    """Returns the best score across direct, token-sort, and prefix matching."""
+    return max(similarity(a, b), token_sort_ratio(a, b), prefix_match_score(a, b))
  
  
 def parse_date(value) -> Optional[date]:
@@ -357,17 +375,19 @@ def parse_orders(wb_orders: openpyxl.Workbook, cutoff: date) -> list:
         col_qty = get_col("CANTIDAD")
         col_mat = get_col("MATERIAL")
         col_rub = get_col("RUBRO")
+        col_cap = get_col("CAPITULO")   # Some pedidos store the code here
         col_est = get_col("ESTADO")
         col_und = get_col("UND.", "UND", "UNIDAD")
  
-        if not (col_qty and col_mat and col_rub):
+        if not (col_qty and col_mat and (col_rub or col_cap)):
             continue
  
         # Read detail rows (from hdr_row+1 until empty CANTIDAD)
         for row_idx in range(hdr_row + 1, ws.max_row + 1):
             qty_val = ws.cell(row_idx, col_qty).value
             mat_val = ws.cell(row_idx, col_mat).value
-            rub_val = ws.cell(row_idx, col_rub).value
+            rub_val = ws.cell(row_idx, col_rub).value if col_rub else None
+            cap_val = ws.cell(row_idx, col_cap).value if col_cap else None
  
             if qty_val is None and mat_val is None:
                 break  # End of data section
@@ -383,7 +403,14 @@ def parse_orders(wb_orders: openpyxl.Workbook, cutoff: date) -> list:
  
             material_str = str(mat_val).strip()
             rubro_str = str(rub_val).strip() if rub_val else ""
-            rubro_code = extract_rubro_code(rubro_str)
+            cap_str   = str(cap_val).strip() if cap_val else ""
+ 
+            # Try RUBRO column first; fall back to CAPITULO when RUBRO has no
+            # numeric code (e.g. Pedido 49 stores "08.01.09" in CAPITULO).
+            rubro_code = extract_rubro_code(rubro_str) or extract_rubro_code(cap_str)
+            # Use whichever column has the full descriptive text
+            rubro_full = rubro_str if rubro_str else cap_str
+ 
             estado = str(ws.cell(row_idx, col_est).value).strip() if col_est else "N/A"
             unit = str(ws.cell(row_idx, col_und).value).strip() if col_und else ""
  
@@ -396,7 +423,7 @@ def parse_orders(wb_orders: openpyxl.Workbook, cutoff: date) -> list:
                 "material": material_str,
                 "norm_material": normalize(material_str),
                 "rubro_code": rubro_code,
-                "rubro_full": rubro_str,
+                "rubro_full": rubro_full,
                 "estado": estado,
             })
  
@@ -515,7 +542,10 @@ def distribute(inv_materials: list, matched_lines: list, rubros: dict) -> tuple:
  
             rubro_code = line["rubro_code"]
             if rubro_code not in rubros:
+                # Rubro not found in inventory headers — record and SKIP.
+                # Do NOT consume remaining; otherwise the qty is silently lost.
                 unmatched_rubros.add((rubro_code, line["rubro_full"]))
+                continue
  
             take = min(line["qty"], remaining)
             row_alloc[rubro_code] += take

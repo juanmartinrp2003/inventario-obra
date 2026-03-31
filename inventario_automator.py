@@ -69,14 +69,20 @@ FUZZY_THRESHOLD = 0.72   # Minimum similarity for "dubious" match
 # ─────────────────────────────────────────────────────────────────────────────
 
 def normalize(text: str) -> str:
-    """Lowercase, strip whitespace, remove parenthetical repetitions."""
+    """Lowercase, strip whitespace, remove ALL parenthetical content.
+    Also normalizes punctuation spacing so e.g. 'N. 18' == 'N.18'."""
     if not text:
         return ""
     s = str(text).strip()
-    # Remove trailing "(Same name)" repetition common in this inventory
-    s = re.sub(r'\s*\([^)]*\)\s*$', '', s).strip()
+    # Remove ALL parenthetical content iteratively (handles nested and multiple)
+    prev = None
+    while prev != s:
+        prev = s
+        s = re.sub(r'\s*\([^()]*\)\s*', ' ', s).strip()
+    # Normalize spaces after periods before digits: "N. 18" → "N.18"
+    s = re.sub(r'\.\s+(\d)', r'.\1', s)
     # Collapse multiple spaces
-    s = re.sub(r'\s+', ' ', s)
+    s = re.sub(r'\s+', ' ', s).strip()
     return s.lower()
 
 
@@ -420,20 +426,22 @@ def distribute(inv_materials: list, matched_lines: list, rubros: dict) -> tuple:
     Apply the LIFO distribution logic (most recent order first).
 
     Returns:
-        allocations: {inv_row: {rubro_code: value_assigned}}
-        list_c: lines from PENDING orders that were used
+        allocations:      {inv_row: {rubro_code: value_assigned}}
+        list_c:           lines from PENDING orders that were used
         unmatched_rubros: rubro codes from orders not found in inventory header
+        remainder_alerts: materials where on_hand > total ordered qty
+                          (remainder auto-assigned to most recent rubro)
     """
-    # Group matched lines by inv_row, filter only matched ones
     from collections import defaultdict
     lines_by_row = defaultdict(list)
     for l in matched_lines:
         if l["inv_row"] is not None:
             lines_by_row[l["inv_row"]].append(l)
 
-    allocations = {}  # inv_row → {rubro_code: qty_assigned}
+    allocations = {}
     list_c = []
     unmatched_rubros = set()
+    remainder_alerts = []
 
     inv_by_row = {m["row"]: m for m in inv_materials}
 
@@ -445,7 +453,7 @@ def distribute(inv_materials: list, matched_lines: list, rubros: dict) -> tuple:
         on_hand = mat["on_hand"]
         avg_cost = mat["avg_cost"]
 
-        # Sort: most recent date first, then by pedido desc, then original order (stable)
+        # Sort: most recent date first, then by pedido desc (stable)
         lines_sorted = sorted(lines, key=lambda l: (l["fecha"], l["pedido"]), reverse=True)
 
         remaining = on_hand
@@ -475,13 +483,29 @@ def distribute(inv_materials: list, matched_lines: list, rubros: dict) -> tuple:
                     "estado": line["estado"],
                 })
 
+        # ── Remainder: on_hand exceeds total ordered qty ──────────────────────
+        if remaining > 1e-9:  # float tolerance
+            # Assign remainder to the most recent order's rubro
+            most_recent = lines_sorted[0]
+            fallback_rubro = most_recent["rubro_code"]
+            row_alloc[fallback_rubro] += remaining
+            remainder_alerts.append({
+                "material":         mat["name"],
+                "on_hand":          on_hand,
+                "cubierto_ordenes": round(on_hand - remaining, 4),
+                "sobrante":         round(remaining, 4),
+                "rubro_asignado":   most_recent["rubro_full"],
+                "pedido_referencia": most_recent["pedido_name"],
+                "fecha_referencia": most_recent["fecha"].strftime("%d/%m/%Y"),
+            })
+
         # Convert qty → value
         allocations[inv_row] = {
             code: round(qty * avg_cost, 2)
             for code, qty in row_alloc.items()
         }
 
-    return allocations, list_c, list(unmatched_rubros)
+    return allocations, list_c, list(unmatched_rubros), remainder_alerts
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -723,7 +747,7 @@ if run_btn:
         matched_lines, list_a, list_b = match_materials(all_materials, order_lines)
 
         # Step 4 – Distribution
-        allocations, list_c, unmatched_rubros = distribute(
+        allocations, list_c, unmatched_rubros, remainder_alerts = distribute(
             all_materials, matched_lines, rubros
         )
 
@@ -740,13 +764,14 @@ if run_btn:
     st.success("✅ Distribución completada exitosamente.")
 
     # ── KPI Strip ─────────────────────────────────────────────────────────────
-    col1, col2, col3, col4, col5 = st.columns(5)
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
     col1.metric("📦 Materiales con stock", len(all_materials))
     col2.metric("📋 Órdenes incluidas", included_sheets,
                 delta=f"-{excluded_sheets} excluidas")
     col3.metric("🔗 Líneas de pedido", len(order_lines))
     col4.metric("⚠ Sin match (Lista A)", len(list_a))
     col5.metric("🔍 Match dudoso (Lista B)", len(list_b))
+    col6.metric("🟡 Sobrante asignado", len(remainder_alerts))
 
     # ── Download ──────────────────────────────────────────────────────────────
     st.markdown('<div class="section-header">💾 Archivo procesado</div>',
@@ -839,6 +864,37 @@ if run_btn:
         st.caption("Estos materiales fueron adjudicados desde órdenes Pendientes (no entregadas físicamente).")
     else:
         st.info("ℹ No se usaron líneas con estado Pendiente en la distribución.")
+
+    # ── Sobrantes asignados ────────────────────────────────────────────────────
+    st.markdown(
+        '<div class="section-header">🟡 LISTA D — Sobrante de stock asignado al último rubro</div>',
+        unsafe_allow_html=True,
+    )
+    if remainder_alerts:
+        df_d = pd.DataFrame(remainder_alerts)
+        df_d.columns = [
+            "Material", "On Hand", "Cubierto por órdenes",
+            "Sobrante", "Rubro asignado (automático)",
+            "Pedido referencia", "Fecha pedido",
+        ]
+        st.dataframe(
+            df_d.style.format({
+                "On Hand": "{:,.4f}",
+                "Cubierto por órdenes": "{:,.4f}",
+                "Sobrante": "{:,.4f}",
+            }).map(
+                lambda v: "background-color: #fff8e1",
+                subset=["Sobrante", "Rubro asignado (automático)"]
+            ),
+            use_container_width=True,
+        )
+        st.caption(
+            "⚠ El stock de estos materiales supera las cantidades en órdenes. "
+            "El sobrante fue asignado automáticamente al rubro del pedido más reciente. "
+            "Revise si corresponde hacer una asignación manual diferente."
+        )
+    else:
+        st.success("✅ Todos los materiales quedaron completamente cubiertos por sus órdenes.")
 
     # ── Rubros no encontrados ──────────────────────────────────────────────────
     if unmatched_rubros:

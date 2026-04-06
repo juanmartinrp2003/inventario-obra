@@ -45,6 +45,16 @@ def save_projects(projects: list[str]) -> None:
         json.dumps({"projects": projects}, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+
+
+def get_project_mappings(project: str) -> dict:
+    """Return manual mappings {inv_norm: order_norm} for the given project."""
+    return st.session_state.mappings.get(project, {})
+
+
+def save_project_mappings(project: str, mappings: dict) -> None:
+    """Persist manual mappings for the given project in session_state."""
+    st.session_state.mappings[project] = mappings
  
 # ─────────────────────────────────────────────────────────────────────────────
 # CONSTANTS
@@ -434,14 +444,21 @@ def parse_orders(wb_orders: openpyxl.Workbook, cutoff: date) -> list:
 # STEP 3 — MATCH MATERIALS
 # ─────────────────────────────────────────────────────────────────────────────
  
-def match_materials(inv_materials: list, order_lines: list) -> tuple:
+def match_materials(inv_materials: list, order_lines: list,
+                    manual_mappings: dict = None) -> tuple:
     """
     Returns:
         matched_lines: same list but each line has 'inv_row' and 'match_type'
-                       ('exact', 'fuzzy', 'none')
+                       ('exact', 'fuzzy', 'manual', 'none')
         list_a: unmatched inventory materials (on_hand>0, no orders)
         list_b: dubious matches
     """
+    # Build reverse lookup order_norm → inv_norm from manual mappings
+    order_to_inv: dict = {}
+    if manual_mappings:
+        for inv_norm, order_norm in manual_mappings.items():
+            order_to_inv[order_norm] = inv_norm
+
     # Build a lookup set of normalized inventory names → material record
     inv_by_norm = {m["norm_name"]: m for m in inv_materials}
     inv_names = list(inv_by_norm.keys())
@@ -455,12 +472,20 @@ def match_materials(inv_materials: list, order_lines: list) -> tuple:
         inv_row = None
         inv_name_matched = None
  
+        # Manual mapping (highest priority — overrides exact and fuzzy)
+        if norm in order_to_inv:
+            mapped_inv_norm = order_to_inv[norm]
+            if mapped_inv_norm in inv_by_norm:
+                inv_row = inv_by_norm[mapped_inv_norm]["row"]
+                inv_name_matched = inv_by_norm[mapped_inv_norm]["name"]
+                match_type = "manual"
+
         # Exact match
-        if norm in inv_by_norm:
+        if match_type == "none" and norm in inv_by_norm:
             inv_row = inv_by_norm[norm]["row"]
             inv_name_matched = inv_by_norm[norm]["name"]
             match_type = "exact"
-        else:
+        elif match_type == "none":
             # Fuzzy match (uses token-sort as well to handle different word orders)
             best_score = 0.0
             best_name = None
@@ -476,6 +501,8 @@ def match_materials(inv_materials: list, order_lines: list) -> tuple:
                 list_b.append({
                     "name_inv": inv_name_matched,
                     "name_order": line["material"],
+                    "norm_inv": best_name,
+                    "norm_order": norm,
                     "pedido": line["pedido_name"],
                     "rubro": line["rubro_full"],
                     "score": round(best_score, 3),
@@ -682,6 +709,10 @@ if "projects" not in st.session_state:
     st.session_state.projects = load_projects()
 if "active_project" not in st.session_state:
     st.session_state.active_project = None
+if "mappings" not in st.session_state:
+    st.session_state.mappings = {}
+if "auto_run" not in st.session_state:
+    st.session_state.auto_run = False
  
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -758,7 +789,36 @@ with st.sidebar:
             help="Archivo con hojas Pedido01, Pedido02…",
             key=f"ord_{active}",
         )
- 
+
+        # ── Mapeos manuales ───────────────────────────────────────────────────
+        st.divider()
+        st.caption("📎 Mapeos manuales")
+        mappings_upload = st.file_uploader(
+            "Cargar mapeos (JSON)",
+            type=["json"],
+            help="Sube el archivo JSON de mapeos guardado en una sesión anterior.",
+            key=f"mapfile_{active}",
+        )
+        if mappings_upload:
+            try:
+                loaded = json.loads(mappings_upload.read().decode("utf-8"))
+                save_project_mappings(active, loaded)
+                st.success(f"✅ {len(loaded)} mapeos cargados.")
+            except Exception as e:
+                st.error(f"Error al cargar mapeos: {e}")
+
+        current_maps = get_project_mappings(active)
+        if current_maps:
+            st.caption(f"🔗 {len(current_maps)} mapeos manuales activos")
+            maps_json = json.dumps(current_maps, ensure_ascii=False, indent=2)
+            st.download_button(
+                "⬇ Descargar mapeos JSON",
+                data=maps_json,
+                file_name=f"mapeos_{re.sub(r'[^\\w-]', '_', active)}.json",
+                mime="application/json",
+                key="dl_maps_sidebar",
+            )
+
         st.divider()
         st.caption(f"Umbral match fuzzy: **{FUZZY_THRESHOLD}**")
  
@@ -795,7 +855,8 @@ if inv_file is None or orders_file is None:
     st.stop()
  
 # ── Process ───────────────────────────────────────────────────────────────────
-if run_btn:
+if run_btn or st.session_state.auto_run:
+    st.session_state.auto_run = False
     with st.spinner("Procesando… esto puede tardar unos segundos."):
  
         # Load workbooks
@@ -824,7 +885,9 @@ if run_btn:
         excluded_sheets = total_orders_sheets - included_sheets
  
         # Step 3 – Matching
-        matched_lines, list_a, list_b = match_materials(all_materials, order_lines)
+        manual_mappings = get_project_mappings(active)
+        matched_lines, list_a, list_b = match_materials(all_materials, order_lines, manual_mappings)
+        manual_match_count = sum(1 for l in matched_lines if l["match_type"] == "manual")
  
         # Step 4 – Distribution
         allocations, list_c, unmatched_rubros, remainder_alerts = distribute(
@@ -844,7 +907,7 @@ if run_btn:
     st.success("✅ Distribución completada exitosamente.")
  
     # ── KPI Strip ─────────────────────────────────────────────────────────────
-    col1, col2, col3, col4, col5, col6 = st.columns(6)
+    col1, col2, col3, col4, col5, col6, col7 = st.columns(7)
     col1.metric("📦 Materiales con stock", len(all_materials))
     col2.metric("📋 Órdenes incluidas", included_sheets,
                 delta=f"-{excluded_sheets} excluidas")
@@ -852,6 +915,7 @@ if run_btn:
     col4.metric("⚠ Sin match (Lista A)", len(list_a))
     col5.metric("🔍 Match dudoso (Lista B)", len(list_b))
     col6.metric("🟡 Sobrante asignado", len(remainder_alerts))
+    col7.metric("🔗 Mapeos aplicados", manual_match_count)
  
     # ── Download ──────────────────────────────────────────────────────────────
     st.markdown('<div class="section-header">💾 Archivo procesado</div>',
@@ -901,6 +965,19 @@ if run_btn:
             height=350,
         )
  
+    # Build deduplicated order material name options for mapping dropdowns
+    _seen_ord: set = set()
+    order_options: list = []  # [(raw, norm), ...]
+    for _l in order_lines:
+        _n = _l["norm_material"]
+        if _n not in _seen_ord:
+            _seen_ord.add(_n)
+            order_options.append((_l["material"], _n))
+    order_options.sort(key=lambda x: x[0])
+    map_display_opts = ["— Sin mapeo —"] + [raw for raw, _ in order_options]
+    map_norm_by_raw = {raw: nrm for raw, nrm in order_options}
+    map_raw_by_norm = {nrm: raw for raw, nrm in order_options}
+
     # ── Lista A ────────────────────────────────────────────────────────────────
     st.markdown(
         '<div class="section-header">📋 LISTA A — Materiales SIN órdenes (asignación manual)</div>',
@@ -917,18 +994,102 @@ if run_btn:
                      use_container_width=True)
     else:
         st.success("✅ Todos los materiales con stock encontraron al menos una orden.")
- 
+
+    # ── Definir mapeos manuales ────────────────────────────────────────────────
+    if list_a:
+        st.markdown(
+            '<div class="section-header">🔗 Definir mapeos manuales — materiales sin match</div>',
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            "Selecciona a qué nombre en las órdenes corresponde cada material sin match. "
+            "Los mapeos persisten entre sesiones (descarga el JSON desde el panel lateral)."
+        )
+        _cur_maps = get_project_mappings(active)
+        with st.form("manual_mappings_form"):
+            for _mat in list_a:
+                _inv_norm = _mat["norm_name"]
+                _cur_order_norm = _cur_maps.get(_inv_norm)
+                _default_idx = 0
+                if _cur_order_norm and _cur_order_norm in map_raw_by_norm:
+                    try:
+                        _default_idx = map_display_opts.index(map_raw_by_norm[_cur_order_norm])
+                    except ValueError:
+                        _default_idx = 0
+                st.selectbox(
+                    f"**{_mat['name']}**",
+                    options=map_display_opts,
+                    index=_default_idx,
+                    key=f"map_{_inv_norm}",
+                )
+            _submitted_a = st.form_submit_button("💾 Guardar mapeos y re-ejecutar", type="primary")
+        if _submitted_a:
+            _new_maps = dict(_cur_maps)
+            for _mat in list_a:
+                _inv_norm = _mat["norm_name"]
+                _sel = st.session_state.get(f"map_{_inv_norm}", "— Sin mapeo —")
+                if _sel == "— Sin mapeo —":
+                    _new_maps.pop(_inv_norm, None)
+                else:
+                    _new_maps[_inv_norm] = map_norm_by_raw[_sel]
+            save_project_mappings(active, _new_maps)
+            st.session_state.auto_run = True
+            st.rerun()
+
     # ── Lista B ────────────────────────────────────────────────────────────────
     st.markdown(
         '<div class="section-header">⚠️ LISTA B — Matches DUDOSOS (requiere confirmación)</div>',
         unsafe_allow_html=True,
     )
     if list_b:
-        df_b = pd.DataFrame(list_b)
-        df_b.columns = ["Nombre en Inv.", "Nombre en Pedido", "Pedido #", "Rubro", "Similitud"]
+        df_b = pd.DataFrame([{
+            "Nombre en Inv.": item["name_inv"],
+            "Nombre en Pedido": item["name_order"],
+            "Pedido #": item["pedido"],
+            "Rubro": item["rubro"],
+            "Similitud": item["score"],
+        } for item in list_b])
         st.dataframe(df_b.style.format({"Similitud": "{:.1%}"}),
                      use_container_width=True)
-        st.caption("Estos matches se procesaron automáticamente. Verifique que sean correctos.")
+        st.caption("Estos matches se procesaron automáticamente. Confirma los correctos o corrige los incorrectos.")
+
+        # Deduplicate list_b by norm_inv so each inv material appears once
+        _seen_b: set = set()
+        _listb_dedup: list = []
+        for _item in list_b:
+            if _item["norm_inv"] not in _seen_b:
+                _seen_b.add(_item["norm_inv"])
+                _listb_dedup.append(_item)
+
+        _cur_maps_b = get_project_mappings(active)
+        _confirm_opts = ["✅ Confirmar match actual"] + map_display_opts  # includes "— Sin mapeo —"
+        with st.form("listb_review_form"):
+            st.caption("Confirma o corrige cada match dudoso:")
+            for _item in _listb_dedup:
+                st.markdown(
+                    f"**Inv:** {_item['name_inv']} &nbsp;→&nbsp; **Orden:** {_item['name_order']}"
+                    f" *(similitud: {_item['score']:.1%})*"
+                )
+                st.selectbox(
+                    "Acción:",
+                    options=_confirm_opts,
+                    index=0,
+                    key=f"listb_{_item['norm_inv']}",
+                    label_visibility="collapsed",
+                )
+            _submitted_b = st.form_submit_button("💾 Guardar correcciones de Lista B", type="secondary")
+        if _submitted_b:
+            _new_maps_b = dict(_cur_maps_b)
+            for _item in _listb_dedup:
+                _sel = st.session_state.get(f"listb_{_item['norm_inv']}", "✅ Confirmar match actual")
+                if _sel == "✅ Confirmar match actual":
+                    # Save the current fuzzy match as a manual mapping
+                    _new_maps_b[_item["norm_inv"]] = _item["norm_order"]
+                elif _sel != "— Sin mapeo —":
+                    _new_maps_b[_item["norm_inv"]] = map_norm_by_raw[_sel]
+            save_project_mappings(active, _new_maps_b)
+            st.session_state.auto_run = True
+            st.rerun()
     else:
         st.success("✅ No hay matches dudosos — todos los nombres coincidieron exactamente.")
  

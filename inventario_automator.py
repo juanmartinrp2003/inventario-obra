@@ -613,22 +613,29 @@ def distribute(inv_materials: list, matched_lines: list, rubros: dict) -> tuple:
         }
 
         # ── Rounding correction ───────────────────────────────────────────────
-        # Due to per-rubro rounding, the sum of allocated values may fall slightly
-        # short of asset_value. If the gap is > 0 and < 1, assign it to the
-        # most recent rubro that was actually allocated.
+        # Compare asset_value against the sum that will *actually be written*
+        # (only rubros that exist in the inventory header). This handles both:
+        #   a) pure per-rubro rounding drift
+        #   b) cases where the remainder was assigned to an invalid rubro
+        # If the gap is > 0 and < 1, absorb it into the most recent valid rubro.
         asset_value = mat["asset_value"]
-        allocated_sum = sum(allocations[inv_row].values())
-        gap = round(asset_value - allocated_sum, 2)
-        if 0 < gap < 1 and allocations[inv_row]:
-            # Use the most recent order's rubro if it was allocated, otherwise first available
-            fallback = next(iter(allocations[inv_row]))
+        written_sum = sum(v for code, v in allocations[inv_row].items()
+                          if code in rubros)
+        gap = asset_value - written_sum          # do NOT round before comparing
+        if 1e-9 < gap < 1:
+            # Walk LIFO order to find the most recent rubro that is valid
+            fallback = None
             for line in lines_sorted:
-                if line["rubro_code"] in allocations[inv_row]:
-                    fallback = line["rubro_code"]
+                rc = line["rubro_code"]
+                if rc in rubros:
+                    if rc not in allocations[inv_row]:
+                        allocations[inv_row][rc] = 0.0
+                    fallback = rc
                     break
-            allocations[inv_row][fallback] = round(
-                allocations[inv_row][fallback] + gap, 2
-            )
+            if fallback is not None:
+                allocations[inv_row][fallback] = round(
+                    allocations[inv_row][fallback] + gap, 2
+                )
 
     return allocations, list_c, list(unmatched_rubros), remainder_alerts
  
